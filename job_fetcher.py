@@ -33,17 +33,21 @@ ACTOR = "valig/linkedin-jobs-scraper"
 APIFY_RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR.replace('/', '~')}/run-sync-get-dataset-items"
 
 SENT_JOBS_FILE = os.path.join(os.path.dirname(__file__), "sent_jobs.json")
+PENDING_POOL_FILE = os.path.join(os.path.dirname(__file__), "pending_pool.json")
 MAX_JOBS_PER_EMAIL = 10
-DEDUP_WINDOW_DAYS = 45  # forget jobs older than this so the file doesn't grow forever
+DEDUP_WINDOW_DAYS = 45   # forget SENT jobs older than this so the file doesn't grow forever
+POOL_WINDOW_DAYS = 30    # drop PENDING (unsent) jobs from the pool once they're this old
 
 # Search plan: (location, keywords, extra url params, tier)
 # Tier is used for the location-priority tiebreaker (lower = higher priority).
+# Priority order: Kochi > Thiruvananthapuram > Remote > Bangalore > Chennai > rest of India
 SEARCHES = [
     ("Kochi, Kerala, India", "Java Developer OR AEM Developer", {"f_E": "2,3"}, 1),
-    ("Bengaluru, Karnataka, India", "Java Developer OR AEM Developer", {"f_E": "2,3"}, 2),
-    ("Chennai, Tamil Nadu, India", "Java Developer OR AEM Developer", {"f_E": "2,3"}, 3),
-    ("India", "Java Developer OR AEM Developer OR Backend Engineer", {"f_E": "2,3"}, 4),
-    ("India", "Java Developer OR AEM Developer Remote", {"f_WT": "2"}, 5),
+    ("Thiruvananthapuram, Kerala, India", "Java Developer OR AEM Developer", {"f_E": "2,3"}, 2),
+    ("India", "Java Developer OR AEM Developer Remote", {"f_WT": "2"}, 3),
+    ("Bengaluru, Karnataka, India", "Java Developer OR AEM Developer", {"f_E": "2,3"}, 4),
+    ("Chennai, Tamil Nadu, India", "Java Developer OR AEM Developer", {"f_E": "2,3"}, 5),
+    ("India", "Java Developer OR AEM Developer OR Backend Engineer", {"f_E": "2,3"}, 6),
 ]
 
 # Profile keywords used for match scoring (from Vysakh's resume)
@@ -198,6 +202,24 @@ def save_sent_jobs(store: dict):
         json.dump(pruned, f, indent=2)
 
 
+def load_pending_pool():
+    """Jobs we've already fetched at least once but haven't sent yet."""
+    if not os.path.exists(PENDING_POOL_FILE):
+        return {}
+    with open(PENDING_POOL_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_pending_pool(pool: dict):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=POOL_WINDOW_DAYS)
+    pruned = {}
+    for jid, job in pool.items():
+        if posted_dt(job) > cutoff:
+            pruned[jid] = job
+    with open(PENDING_POOL_FILE, "w") as f:
+        json.dump(pruned, f, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # CSV + EMAIL
 # ---------------------------------------------------------------------------
@@ -254,8 +276,23 @@ def main():
     sent_store = load_sent_jobs()
     already_sent = set(sent_store.keys())
 
+    # Leftover jobs seen in earlier runs but never sent (e.g. this morning's
+    # extras that didn't make the top 10) — carried forward so nothing gets
+    # silently dropped.
+    pool = load_pending_pool()
+
+    # Fresh fetch, merged into the pool (new jobs added, duplicates ignored).
     raw_jobs = fetch_jobs()
-    top_jobs = filter_and_rank(raw_jobs, already_sent)
+    for job in raw_jobs:
+        jid = job.get("id") or job.get("url")
+        if jid and jid not in already_sent:
+            pool[jid] = job  # overwrite with latest version (fresher postedTimeAgo etc.)
+
+    # Rank the WHOLE pool (old leftovers + new arrivals) together, so a
+    # 3-day-old unsent job from this morning can still outrank a brand new
+    # one this afternoon if it's a better match.
+    candidates = list(pool.values())
+    top_jobs = filter_and_rank(candidates, already_sent)
 
     csv_path = os.path.join(os.path.dirname(__file__), "latest_jobs.csv")
     write_csv(top_jobs, csv_path)
@@ -263,12 +300,22 @@ def main():
     send_email(csv_path, top_jobs, run_label)
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    sent_ids_this_run = set()
     for job in top_jobs:
         jid = job.get("id") or job.get("url")
         sent_store[jid] = now_iso
+        sent_ids_this_run.add(jid)
     save_sent_jobs(sent_store)
 
-    print(f"Sent {len(top_jobs)} jobs. Total tracked (sent, unexpired): {len(sent_store)}")
+    # Remove newly-sent jobs from the pool; everything else stays for next time.
+    remaining_pool = {jid: job for jid, job in pool.items() if jid not in sent_ids_this_run}
+    save_pending_pool(remaining_pool)
+
+    print(
+        f"Sent {len(top_jobs)} jobs. "
+        f"Pool remaining for next run: {len(remaining_pool)}. "
+        f"Total tracked sent (unexpired): {len(sent_store)}."
+    )
 
 
 if __name__ == "__main__":

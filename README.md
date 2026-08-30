@@ -11,23 +11,41 @@ Runs entirely on **GitHub Actions** (free) + **Apify** (free-tier scraper) +
 
 ## How it works
 
-1. `job_fetcher.py` calls the Apify LinkedIn-jobs-scraper for 5 searches:
-   Kochi, Bangalore, Chennai, rest-of-India, and Remote/foreign-hiring roles.
+1. `job_fetcher.py` calls the Apify LinkedIn-jobs-scraper for 6 searches:
+   Kochi, Thiruvananthapuram, Remote/foreign-hiring roles, Bangalore,
+   Chennai, and rest-of-India.
 2. Jobs are filtered to exclude Senior/Lead/Architect titles and experience
    levels above Associate.
-3. Remaining jobs are ranked by:
+3. **Leftover jobs from previous runs that never made the cut** (see
+   "Backlog pooling" below) are merged in with the freshly fetched ones.
+4. The whole combined pool is ranked by:
    1. **Profile match** — keyword overlap with your resume (Java, AEM, Sling
       Models, HTL, Dispatcher, etc.)
    2. **Posted date** — newest first
    3. **Experience level** — Entry level > Associate > Not specified
-   4. **Location priority** — Kochi > Bangalore > Chennai > rest of India >
-      Remote/abroad
-4. The top 10 **new** jobs (i.e. not in `sent_jobs.json`) are written to a
-   CSV and emailed to you.
-5. Those job IDs get added to `sent_jobs.json`, which the workflow commits
-   back to the repo — so the afternoon run (and every day after) won't
-   repeat them. Entries auto-expire after 45 days so the file doesn't grow
-   forever.
+   4. **Location priority** — Kochi > Thiruvananthapuram > Remote/abroad >
+      Bangalore > Chennai > rest of India
+5. The top 10 **new** jobs (i.e. not already in `sent_jobs.json`) are written
+   to a CSV and emailed to you.
+6. Those job IDs get added to `sent_jobs.json` (so they're never sent again),
+   and the workflow commits both that file and `pending_pool.json` back to
+   the repo.
+
+### Backlog pooling (nothing gets lost)
+
+Example: a morning run fetches 30 jobs total (15 Bangalore, 10 Kochi, 5
+Trivandrum). Only the top 10 get sent. The other 20 are saved to
+`pending_pool.json` instead of being discarded. The afternoon run fetches
+fresh jobs *and* adds them to that same pool, then re-ranks everything
+together — so a strong match from the morning that didn't quite make the
+cut can still surface in the afternoon (or the next day), and nothing is
+silently dropped just because it wasn't in the first top-10.
+
+- `sent_jobs.json` — jobs already emailed to you (never sent again).
+  Entries expire after 45 days.
+- `pending_pool.json` — jobs seen but not yet sent, carried forward run to
+  run. Entries expire after 30 days (roughly LinkedIn's own posting window)
+  so stale listings don't linger forever.
 
 **Columns in the CSV:** `Sl.No, Job Role, Company Name, Posted Date, Skills
 Required, Exp Level, Apply Link`
@@ -39,7 +57,8 @@ Required, Exp Level, Apply Link`
 ### 1. Create a GitHub repo
 - Create a new **private** repository (e.g. `job-alerts`).
 - Upload all the files in this folder, keeping the `.github/workflows/`
-  folder structure intact.
+  folder structure intact (including `sent_jobs.json` and
+  `pending_pool.json` — leave them as empty `{}`).
 
 ### 2. Get an Apify API token (free tier)
 - Sign up at [apify.com](https://apify.com) (free plan gives monthly credits,
