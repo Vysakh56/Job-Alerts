@@ -38,6 +38,11 @@ MAX_JOBS_PER_EMAIL = 10
 DEDUP_WINDOW_DAYS = 45   # forget SENT jobs older than this so the file doesn't grow forever
 POOL_WINDOW_DAYS = 30    # drop PENDING (unsent) jobs from the pool once they're this old
 
+# Vysakh's actual years of experience — used to score how well a job's
+# stated experience requirement fits him, independent of LinkedIn's coarse
+# Entry level / Associate tag. Treated as the midpoint of a 2-3 year range.
+HIS_EXPERIENCE_YEARS = 2.5
+
 # Search plan: (location, keywords, extra url params, tier)
 # Tier is used for the location-priority tiebreaker (lower = higher priority).
 # Priority order: Kochi > Thiruvananthapuram > Remote > Bangalore > Chennai > rest of India
@@ -189,18 +194,100 @@ def format_exp_level(job) -> str:
     return f"{level_label} ({min_s}-{max_s} yr)"
 
 
-def match_score(job) -> int:
+def match_score(job) -> float:
+    """
+    Skill-category score — the PRIMARY sort key. Categories, highest to
+    lowest fit for a Java/AEM developer profile:
+
+      5.0  AEM + Java both present            (ideal — matches full profile)
+      4.0  AEM present, Java not required     (core specialty)
+      3.5  Java/Spring Boot, backend-only     (strong language match, no JS)
+      3.0  Java/Spring Boot, full-stack/JS    (language match, but full-stack
+                                                implies JavaScript, a weaker skill)
+      2.0  No specific language named         (generic "software engineer" /
+                                                "backend engineer" posting)
+
+    "java" is matched on a word boundary so it never matches inside
+    "javascript".
+    """
     text = f"{job.get('title','')} {job.get('description','')}".lower()
-    return sum(1 for kw in PROFILE_SKILLS if kw in text)
+
+    has_aem = bool(re.search(
+        r'\b(aem|adobe experience manager|sling|htl|sightly|dispatcher|osgi)\b', text
+    ))
+    has_java = bool(re.search(r'\bjava\b', text)) or bool(re.search(
+        r'\b(spring boot|springboot|spring framework)\b', text
+    ))
+    has_js = bool(re.search(
+        r'\b(javascript|react|angular|vue|typescript|front-?end)\b', text
+    ))
+    is_fullstack = "full stack" in text or "full-stack" in text or "fullstack" in text or has_js
+
+    if has_aem and has_java:
+        return 5.0
+    if has_aem:
+        return 4.0
+    if has_java:
+        return 3.0 if is_fullstack else 3.5
+    return 2.0
+
+
+def is_fresh(job, hours_threshold: int = 6) -> bool:
+    """
+    A job posted within the last few hours is treated as urgent and jumps
+    to the top of the list — but only if it's actually Java/AEM related
+    (not just any job that happened to match a broader search keyword).
+    """
+    text = f"{job.get('title','')} {job.get('description','')}".lower()
+    is_relevant = bool(re.search(r'\b(java|aem|adobe experience manager)\b', text))
+    if not is_relevant:
+        return False
+    age_hours = (datetime.now(timezone.utc) - posted_dt(job)).total_seconds() / 3600
+    return age_hours <= hours_threshold
 
 
 def exp_score(job) -> int:
     level = (job.get("experienceLevel") or "").lower()
     if level in ("entry level",):
-        return 3
-    if level in ("associate", "not applicable", ""):
         return 2
-    return 0  # mid-senior+ shouldn't reach here (filtered), but just in case
+    if level in ("associate",):
+        return 1
+    return 0  # "not applicable" / missing — no longer penalized heavily, see filter_and_rank
+
+
+def exp_fit_score(job) -> float:
+    """
+    How well the job's ACTUAL stated years-of-experience (parsed from the
+    description, not LinkedIn's coarse tag) fits Vysakh's real 2-3 years.
+    This outranks location — a numeric mismatch matters more than being in
+    the wrong city, but a numeric match matters less than skill fit.
+
+    Higher = better fit.
+      - Comfortably qualifies AND range is tight around 2-3 yrs -> highest
+      - Comfortably qualifies, wider/one-sided range (e.g. "2+ years",
+        "up to 5 years") -> good, but not as high as a tight match
+      - No number stated at all -> neutral (0)
+      - Needs MORE experience than he has (e.g. "5+ years") -> penalized,
+        worse the bigger the gap
+      - Overqualified (e.g. "0-1 years") -> mildly penalized
+    """
+    min_y, max_y = extract_experience_range(job.get("description", ""))
+    if min_y is None and max_y is None:
+        return 0.0
+
+    if min_y is not None and HIS_EXPERIENCE_YEARS < min_y:
+        gap = min_y - HIS_EXPERIENCE_YEARS
+        return -gap * 2  # under-qualified: penalized harder
+
+    if max_y is not None and HIS_EXPERIENCE_YEARS > max_y:
+        gap = HIS_EXPERIENCE_YEARS - max_y
+        return -gap  # overqualified: penalized more lightly
+
+    # He comfortably qualifies — reward tighter ranges around his level
+    if min_y is not None and max_y is not None:
+        span = max_y - min_y
+        return 5.0 - min(span, 4)
+    return 3.0  # only one bound given, but he clearly qualifies
 
 
 def posted_dt(job):
@@ -227,12 +314,28 @@ def filter_and_rank(jobs, already_sent: set):
             continue
         filtered.append(job)
 
+    # Sort priority, in order:
+    #   1. Freshness — posted <=6 hrs ago (and actually Java/AEM related)
+    #      jumps straight to the top, ahead of everything else.
+    #   2. Skill-category match — AEM+Java > AEM > Java backend >
+    #      Java full-stack > no language named.
+    #   3. Posted recency — newer first.
+    #   4. Experience NUMBER fit — how well the stated years-required
+    #      (parsed from the description) matches his real 2-3 years.
+    #      This outranks location.
+    #   5. Location priority — Kochi > Trivandrum > Remote/abroad >
+    #      Bangalore > Chennai > rest of India.
+    #   6. Experience LEVEL tag — Entry level > Associate > Missing.
+    #      Last and weak: a "Missing" tag in a top location should still
+    #      beat a tagged "Associate" job in a lower-priority location.
     filtered.sort(
         key=lambda j: (
-            -match_score(j),        # 1. best profile match first
-            -posted_dt(j).timestamp(),  # 2. most recently posted first
-            -exp_score(j),          # 3. entry/associate over "not applicable"
-            j.get("_tier", 99),     # 4. location priority (Kochi>Blr>Chennai>India>Remote)
+            0 if is_fresh(j) else 1,
+            -match_score(j),
+            -posted_dt(j).timestamp(),
+            -exp_fit_score(j),
+            j.get("_tier", 99),
+            -exp_score(j),
         )
     )
     return filtered[:MAX_JOBS_PER_EMAIL]
