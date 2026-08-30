@@ -27,7 +27,7 @@ import requests
 APIFY_TOKEN = os.environ["APIFY_TOKEN"]
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "vysakhvenugopalan@gmail.com")
+RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
 
 ACTOR = "valig/linkedin-jobs-scraper"
 APIFY_RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR.replace('/', '~')}/run-sync-get-dataset-items"
@@ -132,6 +132,63 @@ def extract_skills(description: str) -> str:
     return ", ".join(sorted(set(cleaned))[:8]) if cleaned else "Java/AEM (see listing)"
 
 
+def extract_experience_range(description: str):
+    """
+    Looks in the job description for an explicit years-of-experience figure,
+    since LinkedIn's own "Entry level" / "Associate" tag often doesn't match
+    what's actually written in the body (e.g. tagged Entry level but body
+    says "3-5 years experience required").
+
+    Returns (min_years, max_years) — either can be None if not stated.
+    """
+    if not description:
+        return None, None
+    text = description.lower()
+
+    # "3-5 years", "3 to 5 years", "3–5 yrs"
+    m = re.search(r'(\d+)\s*(?:-|to|–|—)\s*(\d+)\s*\+?\s*years?', text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    # "2+ years", "minimum 2 years", "at least 2 years", "min. 2 yrs"
+    m = re.search(r'(?:minimum|min\.?|at least)\s*(\d+)\+?\s*years?', text)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r'(\d+)\+\s*years?', text)
+    if m:
+        return int(m.group(1)), None
+
+    # "up to 5 years", "maximum 5 years", "less than 5 years"
+    m = re.search(r'(?:up to|maximum|max\.?|less than)\s*(\d+)\s*years?', text)
+    if m:
+        return None, int(m.group(1))
+
+    return None, None
+
+
+def format_exp_level(job) -> str:
+    """
+    Combines LinkedIn's tagged level with any explicit range found in the
+    description, e.g.:
+      "Entry level" + description says "3-5 years"  -> "Entry level (3-5 yr)"
+      no tag + description says "2-4 years"          -> "Missing (2-4 yr)"
+      "Entry level" + description says "min 2 years" -> "Entry level (2-none yr)"
+      "Entry level" + description says "up to 5 yrs" -> "Entry level (none-5 yr)"
+      "Entry level" + nothing found in description    -> "Entry level"
+    """
+    raw_level = (job.get("experienceLevel") or "").strip()
+    is_tagged = bool(raw_level) and raw_level.lower() != "not applicable"
+    level_label = raw_level if is_tagged else "Missing"
+
+    min_y, max_y = extract_experience_range(job.get("description", ""))
+    if min_y is None and max_y is None:
+        return raw_level if is_tagged else "Not specified"
+
+    min_s = str(min_y) if min_y is not None else "none"
+    max_s = str(max_y) if max_y is not None else "none"
+    return f"{level_label} ({min_s}-{max_s} yr)"
+
+
 def match_score(job) -> int:
     text = f"{job.get('title','')} {job.get('description','')}".lower()
     return sum(1 for kw in PROFILE_SKILLS if kw in text)
@@ -228,7 +285,7 @@ def write_csv(jobs, path):
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "Sl.No", "Job Role", "Company Name", "Posted Date",
+            "Sl.No", "Job Role", "Company Name", "Location", "Posted Date",
             "Skills Required", "Exp Level", "Apply Link",
         ])
         for i, job in enumerate(jobs, 1):
@@ -236,9 +293,10 @@ def write_csv(jobs, path):
                 i,
                 job.get("title", ""),
                 job.get("companyName", ""),
+                job.get("location", "Not specified"),
                 job.get("postedTimeAgo") or job.get("postedDate", ""),
                 extract_skills(job.get("description", "")),
-                job.get("experienceLevel", "Not specified"),
+                format_exp_level(job),
                 job.get("url", ""),
             ])
 

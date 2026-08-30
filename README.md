@@ -1,118 +1,74 @@
-# Job Alerts — Automated LinkedIn Digest (Java/AEM, India)
+# job-alerts
 
-Sends you a CSV of up to 10 new Java/AEM job matches to
-**vysakhvenugopalan@gmail.com** every day at **8:00 AM** and **1:00 PM IST**,
-never repeating a job you've already been sent.
+Twice a day, this pulls fresh Java/AEM job postings off LinkedIn, ranks them
+against my resume, and emails me a CSV of the top 10 I haven't seen yet.
+Built it because scrolling LinkedIn every morning got old.
 
-Runs entirely on **GitHub Actions** (free) + **Apify** (free-tier scraper) +
-**Gmail SMTP** (free). No servers, no paid hosting.
+Runs on GitHub Actions — no server, no hosting cost.
 
----
+## Stack
 
-## How it works
+- **Apify** — LinkedIn jobs scraper (free tier)
+- **GitHub Actions** — cron schedule + execution
+- **Python** (`requests`, `smtplib`) — filtering, ranking, email
 
-1. `job_fetcher.py` calls the Apify LinkedIn-jobs-scraper for 6 searches:
-   Kochi, Thiruvananthapuram, Remote/foreign-hiring roles, Bangalore,
-   Chennai, and rest-of-India.
-2. Jobs are filtered to exclude Senior/Lead/Architect titles and experience
-   levels above Associate.
-3. **Leftover jobs from previous runs that never made the cut** (see
-   "Backlog pooling" below) are merged in with the freshly fetched ones.
-4. The whole combined pool is ranked by:
-   1. **Profile match** — keyword overlap with your resume (Java, AEM, Sling
-      Models, HTL, Dispatcher, etc.)
-   2. **Posted date** — newest first
-   3. **Experience level** — Entry level > Associate > Not specified
-   4. **Location priority** — Kochi > Thiruvananthapuram > Remote/abroad >
-      Bangalore > Chennai > rest of India
-5. The top 10 **new** jobs (i.e. not already in `sent_jobs.json`) are written
-   to a CSV and emailed to you.
-6. Those job IDs get added to `sent_jobs.json` (so they're never sent again),
-   and the workflow commits both that file and `pending_pool.json` back to
-   the repo.
+## What it does
 
-### Backlog pooling (nothing gets lost)
+- Searches Kochi, Thiruvananthapuram, remote/international, Bangalore,
+  Chennai, and pan-India — in that priority order
+- Filters out anything senior/lead/architect level, keeps entry-level and
+  associate roles
+- Cross-checks the description text for an actual years-of-experience
+  figure, since LinkedIn's "Entry level" tag and the fine print in the post
+  don't always agree — output looks like `Entry level (2-4 yr)` or
+  `Missing (3-5 yr)` when the tag and the text disagree or one's absent
+- Scores every job on keyword overlap with my skills (Java, AEM, Sling
+  Models, HTL, Dispatcher, etc.), then sorts by that, then recency, then
+  experience level, then location priority
+- Keeps a running log (`sent_jobs.json`) so nothing gets emailed twice, and
+  a `pending_pool.json` so jobs that don't make the top 10 in one run stick
+  around and get re-ranked next time instead of disappearing
+- Emails the top 10 as a CSV: role, company, location, posted date, matched
+  skills, experience level, apply link
 
-Example: a morning run fetches 30 jobs total (15 Bangalore, 10 Kochi, 5
-Trivandrum). Only the top 10 get sent. The other 20 are saved to
-`pending_pool.json` instead of being discarded. The afternoon run fetches
-fresh jobs *and* adds them to that same pool, then re-ranks everything
-together — so a strong match from the morning that didn't quite make the
-cut can still surface in the afternoon (or the next day), and nothing is
-silently dropped just because it wasn't in the first top-10.
+Schedule: 8 AM and 1 PM IST daily (`.github/workflows/job-alerts.yml`).
 
-- `sent_jobs.json` — jobs already emailed to you (never sent again).
-  Entries expire after 45 days.
-- `pending_pool.json` — jobs seen but not yet sent, carried forward run to
-  run. Entries expire after 30 days (roughly LinkedIn's own posting window)
-  so stale listings don't linger forever.
+## Running your own copy
 
-**Columns in the CSV:** `Sl.No, Job Role, Company Name, Posted Date, Skills
-Required, Exp Level, Apply Link`
+1. Fork/clone this repo.
+2. Get an [Apify](https://apify.com) API token (Settings → Integrations)
+   — free tier covers this easily at 2 runs/day.
+3. Generate a Gmail [app password](https://myaccount.google.com/apppasswords)
+   (needs 2-Step Verification on first). This is separate from your real
+   password and can be revoked anytime — it only allows sending mail
+   through SMTP, nothing else.
+4. Add repo secrets under **Settings → Secrets and variables → Actions**:
+   - `APIFY_TOKEN`
+   - `GMAIL_ADDRESS`
+   - `GMAIL_APP_PASSWORD`
+   - `RECIPIENT_EMAIL`
+5. Trigger a manual run from the **Actions** tab to confirm it works before
+   waiting for the schedule.
 
----
+Nothing sensitive lives in the code — all credentials are GitHub encrypted
+secrets, referenced via `os.environ`, never hardcoded.
 
-## One-time setup (about 10 minutes)
+## Tuning it
 
-### 1. Create a GitHub repo
-- Create a new **private** repository (e.g. `job-alerts`).
-- Upload all the files in this folder, keeping the `.github/workflows/`
-  folder structure intact (including `sent_jobs.json` and
-  `pending_pool.json` — leave them as empty `{}`).
+Everything worth tweaking is near the top of `job_fetcher.py`:
 
-### 2. Get an Apify API token (free tier)
-- Sign up at [apify.com](https://apify.com) (free plan gives monthly credits,
-  which is enough for 2 runs/day at this scale).
-- Go to **Settings → Integrations** and copy your API token.
+- `SEARCHES` — cities/keywords/location priority order
+- `PROFILE_SKILLS` — keywords used for match scoring
+- `TITLE_EXCLUDE` — seniority terms to filter out
+- `MAX_JOBS_PER_EMAIL` — how many jobs per email (default 10)
+- `DEDUP_WINDOW_DAYS` / `POOL_WINDOW_DAYS` — how long jobs are remembered
 
-### 3. Create a Gmail App Password
-Gmail blocks plain-password SMTP logins, so you need an "app password":
-- Turn on 2-Step Verification on your Google account if it isn't already:
-  https://myaccount.google.com/security
-- Go to https://myaccount.google.com/apppasswords
-- Create a new app password (name it "job-alerts"), copy the 16-character
-  code.
+## Known limitations
 
-### 4. Add secrets to your GitHub repo
-In your repo: **Settings → Secrets and variables → Actions → New repository
-secret**. Add these four:
-
-| Secret name | Value |
-|---|---|
-| `APIFY_TOKEN` | your Apify API token |
-| `GMAIL_ADDRESS` | the Gmail address you'll send *from* (can be the same or a different account) |
-| `GMAIL_APP_PASSWORD` | the 16-character app password from step 3 |
-| `RECIPIENT_EMAIL` | `vysakhvenugopalan@gmail.com` |
-
-### 5. Enable the workflow
-- GitHub Actions is enabled by default on new repos. The schedule in
-  `.github/workflows/job-alerts.yml` will start firing automatically at the
-  next 8 AM or 1 PM IST slot.
-- To test it immediately: go to the **Actions** tab → **Job Alerts** →
-  **Run workflow** (this uses the `workflow_dispatch` trigger).
-
----
-
-## Notes & limitations
-
-- **GitHub Actions cron schedules can lag by a few minutes** during high load
-  on GitHub's shared runners — expect the email within ~15 minutes of 8 AM /
-  1 PM IST, not to the second.
-- **Apify free-tier credits** are limited per month. Two runs/day at ~10
-  jobs each should fit comfortably, but if you add more searches or higher
-  limits later, keep an eye on usage at apify.com/billing.
-- I intentionally did **not** wire this up to your LinkedIn login to check
-  "viewed/clicked" status — LinkedIn's terms prohibit automated access via
-  personal accounts and doing so risks a ban. The dedup file achieves the
-  same practical goal (never see the same job twice) without that risk.
-- If a scheduled run fails (e.g. Apify hiccup), check the **Actions** tab
-  for the error log — nothing will silently break for good, but that run's
-  email won't go out.
-
-## Adjusting things later
-- **Change job count per email:** edit `MAX_JOBS_PER_EMAIL` in `job_fetcher.py`.
-- **Add/remove cities or searches:** edit the `SEARCHES` list.
-- **Tweak skill keywords / seniority filter:** edit `PROFILE_SKILLS` and
-  `TITLE_EXCLUDE`.
-- **Change times:** edit the two `cron:` lines in the workflow file (remember
-  they're in UTC, IST is UTC+5:30).
+- GitHub's free scheduled runs can lag a few minutes past the exact cron
+  time under load
+- Apify free-tier credits are finite — fine at this volume, but scaling up
+  search count/frequency will eat into them faster
+- Doesn't touch my LinkedIn account directly (no login, no "mark as
+  viewed") — LinkedIn's ToS doesn't look kindly on automating a personal
+  account, so dedup is handled entirely through the local job-ID log instead
