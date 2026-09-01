@@ -1,11 +1,18 @@
 name: Job Alerts
 
 on:
-  schedule:
-    # Times are UTC. IST = UTC+5:30.
-    - cron: "30 2 * * *"   # 8:00 AM IST
-    - cron: "30 7 * * *"   # 1:00 PM IST
-  workflow_dispatch: {}    # lets you trigger a run manually from the Actions tab
+  # NOTE: GitHub's own `schedule:` trigger is intentionally NOT used here.
+  # GitHub only guarantees scheduled runs on a "best effort" basis and can
+  # silently skip or delay them under load — which is exactly what caused
+  # missed 8 AM / 1 PM runs before. cron-job.org now triggers this workflow
+  # externally via workflow_dispatch instead, which is far more reliable.
+  # Keeping BOTH would risk duplicate emails, so schedule: stays removed.
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Run label shown in the email subject (e.g. 'Morning Digest')"
+        required: false
+        default: "Job Digest"
 
 permissions:
   contents: write   # needed so the workflow can commit the updated dedup file
@@ -25,24 +32,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Determine run label (morning vs afternoon)
-        id: label
-        run: |
-          if [ "${{ github.event.schedule }}" = "30 2 * * *" ]; then
-            echo "label=Morning Digest (8 AM IST)" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "30 7 * * *" ]; then
-            echo "label=Afternoon Digest (1 PM IST)" >> "$GITHUB_OUTPUT"
-          else
-            echo "label=Manual Run" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Run job fetcher
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          RUN_LABEL: ${{ steps.label.outputs.label }}
+          RUN_LABEL: ${{ github.event.inputs.label }}
         run: python job_fetcher.py
 
       - name: Commit updated dedup + pool files

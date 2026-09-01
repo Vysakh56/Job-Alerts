@@ -35,8 +35,12 @@ APIFY_RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR.replace('/', '~')}/run-sy
 SENT_JOBS_FILE = os.path.join(os.path.dirname(__file__), "sent_jobs.json")
 PENDING_POOL_FILE = os.path.join(os.path.dirname(__file__), "pending_pool.json")
 MAX_JOBS_PER_EMAIL = 10
-DEDUP_WINDOW_DAYS = 45   # forget SENT jobs older than this so the file doesn't grow forever
+DEDUP_WINDOW_DAYS = 30   # matches the 30-day LinkedIn search window — a job
+                         # older than this will never resurface in a search
+                         # anyway, so there's no point remembering it longer
 POOL_WINDOW_DAYS = 30    # drop PENDING (unsent) jobs from the pool once they're this old
+REPOST_GAP_HOURS = 12    # if a previously-sent job's postedDate jumps forward
+                         # by more than this, treat it as reposted = new
 
 # Vysakh's actual years of experience — used to score how well a job's
 # stated experience requirement fits him, independent of LinkedIn's coarse
@@ -194,6 +198,22 @@ def format_exp_level(job) -> str:
     return f"{level_label} ({min_s}-{max_s} yr)"
 
 
+def _skill_flags(text: str):
+    """Shared regex flags used by both match_score and the experience filter."""
+    text = text.lower()
+    has_aem = bool(re.search(
+        r'\b(aem|adobe experience manager|sling|htl|sightly|dispatcher|osgi)\b', text
+    ))
+    has_java = bool(re.search(r'\bjava\b', text)) or bool(re.search(
+        r'\b(spring boot|springboot|spring framework)\b', text
+    ))
+    has_js = bool(re.search(
+        r'\b(javascript|react|angular|vue|typescript|front-?end)\b', text
+    ))
+    is_fullstack = "full stack" in text or "full-stack" in text or "fullstack" in text or has_js
+    return has_aem, has_java, is_fullstack
+
+
 def match_score(job) -> float:
     """
     Skill-category score — the PRIMARY sort key. Categories, highest to
@@ -210,18 +230,8 @@ def match_score(job) -> float:
     "java" is matched on a word boundary so it never matches inside
     "javascript".
     """
-    text = f"{job.get('title','')} {job.get('description','')}".lower()
-
-    has_aem = bool(re.search(
-        r'\b(aem|adobe experience manager|sling|htl|sightly|dispatcher|osgi)\b', text
-    ))
-    has_java = bool(re.search(r'\bjava\b', text)) or bool(re.search(
-        r'\b(spring boot|springboot|spring framework)\b', text
-    ))
-    has_js = bool(re.search(
-        r'\b(javascript|react|angular|vue|typescript|front-?end)\b', text
-    ))
-    is_fullstack = "full stack" in text or "full-stack" in text or "fullstack" in text or has_js
+    text = f"{job.get('title','')} {job.get('description','')}"
+    has_aem, has_java, is_fullstack = _skill_flags(text)
 
     if has_aem and has_java:
         return 5.0
@@ -290,6 +300,52 @@ def exp_fit_score(job) -> float:
     return 3.0  # only one bound given, but he clearly qualifies
 
 
+def passes_experience_ceiling(job) -> bool:
+    """
+    Hard cutoff on required years, separate from the numeric FIT score above:
+      - Requires 5+ years  -> always excluded, no exceptions.
+      - Requires exactly 4 years (e.g. "4-6", "4-8") -> excluded UNLESS
+        it's an AEM role, posted within the last 6 hours, AND a strong
+        skill match (AEM alone or AEM+Java) — i.e. only let a 4-year
+        requirement through when it's an urgent, near-perfect AEM fit.
+      - 3 years or fewer, or no number stated at all -> passes through
+        (numeric fit is still scored/ranked separately by exp_fit_score).
+    """
+    min_y, _ = extract_experience_range(job.get("description", ""))
+    if min_y is None:
+        return True
+    if min_y >= 5:
+        return False
+    if min_y == 4:
+        has_aem, _, _ = _skill_flags(f"{job.get('title','')} {job.get('description','')}")
+        return has_aem and is_fresh(job) and match_score(job) >= 4.0
+    return True
+
+
+def extract_apply_contact(description: str) -> str:
+    """
+    Pulls an application form link or a contact email out of the job
+    description, if one is explicitly given (e.g. a Google Form link, or
+    "email your resume to hr@company.com"). Returns "" if neither is found.
+    """
+    if not description:
+        return ""
+
+    form_match = re.search(
+        r'https?://(?:[\w.-]*\.)?(?:forms\.gle|docs\.google\.com/forms|forms\.office\.com|'
+        r'airtable\.com|typeform\.com)\S*',
+        description, re.IGNORECASE,
+    )
+    if form_match:
+        return form_match.group(0).rstrip('.,)>')
+
+    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+', description)
+    if email_match:
+        return email_match.group(0).rstrip('.,)>')
+
+    return ""
+
+
 def posted_dt(job):
     ds = job.get("postedDate")
     if not ds:
@@ -300,17 +356,19 @@ def posted_dt(job):
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def filter_and_rank(jobs, already_sent: set):
+def filter_and_rank(jobs, sent_store: dict):
     filtered = []
     for job in jobs:
         jid = job.get("id") or job.get("url")
-        if not jid or jid in already_sent:
+        if not jid or is_effectively_sent(job, sent_store):
             continue
         title = job.get("title", "")
         if is_excluded_title(title):
             continue
         level = (job.get("experienceLevel") or "").lower()
         if level not in GOOD_EXP_LEVELS:
+            continue
+        if not passes_experience_ceiling(job):
             continue
         filtered.append(job)
 
@@ -345,29 +403,93 @@ def filter_and_rank(jobs, already_sent: set):
 # DEDUP STORE
 # ---------------------------------------------------------------------------
 
-def load_sent_jobs():
-    if not os.path.exists(SENT_JOBS_FILE):
+def _load_json_safely(path: str, label: str) -> dict:
+    """
+    Reads a JSON state file, tolerating the file not existing yet OR being
+    empty/corrupted (e.g. uploaded as 0 bytes, a bad manual edit, etc).
+    Never crashes the whole run over a state file — worst case we just
+    start that file fresh, which only risks a few duplicate emails, not a
+    broken pipeline.
+    """
+    if not os.path.exists(path):
         return {}
-    with open(SENT_JOBS_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(path, "r") as f:
+            content = f.read().strip()
+        if not content:
+            print(f"[warn] {label} ({path}) is empty — starting fresh.")
+            return {}
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"[warn] {label} ({path}) has invalid JSON ({e}) — starting fresh.")
+        return {}
+
+
+def load_sent_jobs():
+    return _load_json_safely(SENT_JOBS_FILE, "sent jobs log")
+
+
+def is_effectively_sent(job, sent_store: dict) -> bool:
+    """
+    True if this job was already sent AND isn't a fresh repost.
+
+    LinkedIn sometimes reposts an old listing — the job ID may stay the
+    same but it becomes a genuinely new opportunity. We treat it as new
+    (i.e. NOT "already sent") if either:
+      - LinkedIn's own "postedTimeAgo" text says "repost", or
+      - the job's postedDate has jumped forward by more than
+        REPOST_GAP_HOURS since we last sent it.
+    """
+    jid = job.get("id") or job.get("url")
+    if not jid or jid not in sent_store:
+        return False
+
+    record = sent_store[jid]
+    stored_posted = record.get("posted_at") if isinstance(record, dict) else None
+
+    posted_time_ago = (job.get("postedTimeAgo") or "").lower()
+    if "repost" in posted_time_ago:
+        return False
+
+    current_posted_iso = job.get("postedDate")
+    if stored_posted and current_posted_iso:
+        try:
+            stored_dt = datetime.fromisoformat(stored_posted.replace("Z", "+00:00"))
+            current_dt = datetime.fromisoformat(current_posted_iso.replace("Z", "+00:00"))
+            if current_dt > stored_dt + timedelta(hours=REPOST_GAP_HOURS):
+                return False
+        except Exception:
+            pass
+
+    return True
 
 
 def save_sent_jobs(store: dict):
+    """
+    Prunes entries older than DEDUP_WINDOW_DAYS (based on when WE sent it,
+    not when it was posted) and normalizes any legacy plain-string entries
+    (from before repost-tracking existed) into the {sent_at, posted_at}
+    shape going forward.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=DEDUP_WINDOW_DAYS)
-    pruned = {
-        jid: ts for jid, ts in store.items()
-        if datetime.fromisoformat(ts) > cutoff
-    }
+    pruned = {}
+    for jid, record in store.items():
+        sent_at_str = record if isinstance(record, str) else record.get("sent_at")
+        try:
+            sent_at = datetime.fromisoformat(sent_at_str)
+        except Exception:
+            continue  # malformed entry — drop it rather than crash
+        if sent_at > cutoff:
+            pruned[jid] = record if isinstance(record, dict) else {
+                "sent_at": record, "posted_at": None,
+            }
     with open(SENT_JOBS_FILE, "w") as f:
         json.dump(pruned, f, indent=2)
 
 
 def load_pending_pool():
     """Jobs we've already fetched at least once but haven't sent yet."""
-    if not os.path.exists(PENDING_POOL_FILE):
-        return {}
-    with open(PENDING_POOL_FILE, "r") as f:
-        return json.load(f)
+    return _load_json_safely(PENDING_POOL_FILE, "pending pool")
 
 
 def save_pending_pool(pool: dict):
@@ -389,7 +511,7 @@ def write_csv(jobs, path):
         writer = csv.writer(f)
         writer.writerow([
             "Sl.No", "Job Role", "Company Name", "Location", "Posted Date",
-            "Skills Required", "Exp Level", "Apply Link",
+            "Skills Required", "Exp Level", "Apply Form/Mail", "Apply Link",
         ])
         for i, job in enumerate(jobs, 1):
             writer.writerow([
@@ -400,6 +522,7 @@ def write_csv(jobs, path):
                 job.get("postedTimeAgo") or job.get("postedDate", ""),
                 extract_skills(job.get("description", "")),
                 format_exp_level(job),
+                extract_apply_contact(job.get("description", "")),
                 job.get("url", ""),
             ])
 
@@ -435,25 +558,25 @@ def main():
     run_label = os.environ.get("RUN_LABEL", "Job Digest")
 
     sent_store = load_sent_jobs()
-    already_sent = set(sent_store.keys())
 
     # Leftover jobs seen in earlier runs but never sent (e.g. this morning's
     # extras that didn't make the top 10) — carried forward so nothing gets
     # silently dropped.
     pool = load_pending_pool()
 
-    # Fresh fetch, merged into the pool (new jobs added, duplicates ignored).
+    # Fresh fetch, merged into the pool (new jobs added, duplicates ignored,
+    # genuine reposts of already-sent jobs let back in).
     raw_jobs = fetch_jobs()
     for job in raw_jobs:
         jid = job.get("id") or job.get("url")
-        if jid and jid not in already_sent:
+        if jid and not is_effectively_sent(job, sent_store):
             pool[jid] = job  # overwrite with latest version (fresher postedTimeAgo etc.)
 
     # Rank the WHOLE pool (old leftovers + new arrivals) together, so a
     # 3-day-old unsent job from this morning can still outrank a brand new
     # one this afternoon if it's a better match.
     candidates = list(pool.values())
-    top_jobs = filter_and_rank(candidates, already_sent)
+    top_jobs = filter_and_rank(candidates, sent_store)
 
     csv_path = os.path.join(os.path.dirname(__file__), "latest_jobs.csv")
     write_csv(top_jobs, csv_path)
@@ -464,7 +587,7 @@ def main():
     sent_ids_this_run = set()
     for job in top_jobs:
         jid = job.get("id") or job.get("url")
-        sent_store[jid] = now_iso
+        sent_store[jid] = {"sent_at": now_iso, "posted_at": job.get("postedDate")}
         sent_ids_this_run.add(jid)
     save_sent_jobs(sent_store)
 
